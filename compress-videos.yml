@@ -1,0 +1,84 @@
+name: Kompres Video Otomatis
+
+# Jalan otomatis setiap kali ada file .mp4 yang ditambah/diubah di branch main.
+# Juga bisa dijalankan manual lewat tab "Actions" di GitHub (workflow_dispatch)
+# kalau ingin memaksa kompres ulang semua video kapan saja.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.mp4'
+  workflow_dispatch: {}
+
+# Izin menulis diperlukan supaya workflow bisa commit hasil video
+# yang sudah dikompres kembali ke repo.
+permissions:
+  contents: write
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Kompres semua file .mp4 yang masih di atas ambang batas ukuran
+        run: |
+          set -e
+          # Ambang batas: video di atas 3MB akan dikompres ulang.
+          # Video yang sudah kecil (hasil kompresi sebelumnya) dilewati
+          # supaya workflow tidak berulang kali memproses file yang sama.
+          THRESHOLD_BYTES=3145728
+
+          find . -type f -iname "*.mp4" -not -path "./.git/*" | while read -r f; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -le "$THRESHOLD_BYTES" ]; then
+              echo "Lewati (sudah kecil): $f ($size bytes)"
+              continue
+            fi
+
+            echo "Kompres: $f ($size bytes)"
+            tmpfile="${f%.mp4}.compressed.mp4"
+
+            # -vf scale: turunkan ke maksimal tinggi 720px, lebar menyesuaikan
+            #            rasio asli (kelipatan 2 supaya kompatibel H.264).
+            # -crf 28:   kualitas visual masih baik untuk klip latihan singkat,
+            #            ukuran file jauh lebih kecil (crf lebih tinggi = lebih kecil).
+            # -preset veryfast: proses kompresi cepat, cukup untuk kebutuhan ini.
+            # -movflags +faststart: metadata dipindah ke awal file supaya video
+            #            bisa mulai diputar sebelum download selesai (penting
+            #            untuk web/GitHub Pages, bukan CDN streaming khusus).
+            # -c:a aac -b:a 96k: audio dikompres ringan, cukup untuk video latihan.
+            ffmpeg -y -i "$f" \
+              -vf "scale=-2:'min(720,ih)'" \
+              -c:v libx264 -crf 28 -preset veryfast \
+              -c:a aac -b:a 96k \
+              -movflags +faststart \
+              "$tmpfile"
+
+            newsize=$(stat -c%s "$tmpfile")
+            if [ "$newsize" -lt "$size" ]; then
+              mv -f "$tmpfile" "$f"
+              echo "  -> selesai, ukuran baru: $newsize bytes"
+            else
+              echo "  -> hasil kompresi tidak lebih kecil, file asli dipertahankan"
+              rm -f "$tmpfile"
+            fi
+          done
+
+      - name: Commit video hasil kompresi (jika ada perubahan)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Tidak ada video yang berubah, tidak perlu commit."
+          else
+            git add -A -- '*.mp4'
+            git commit -m "Auto-compress video mp4 [skip ci]"
+            git push
+          fi
